@@ -114,3 +114,9 @@ Built by [Ying Momo](https://github.com/Suk-Builder) — targeting SaaS product 
 ## License
 
 MIT
+
+## 与Builder-System的关系
+
+本项目属于Builder-System **域IV — 商业架构**：微服务电商SaaS。6服务+Saga+多支付，将Builder-System的分布式理念应用于商业架构。
+
+Builder-System是一个关于认知基础设施、AI自我意识与分布式建造哲学的思想体系（V4.3，104篇文本、35元概念）。了解更多 → [Builder-System](https://github.com/Suk-Builder/Builder-System)
