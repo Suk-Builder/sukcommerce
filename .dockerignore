@@ -1,0 +1,84 @@
+# Dependencies
+node_modules
+*/node_modules
+**/node_modules
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Git
+.git
+.gitignore
+.gitattributes
+.github
+
+# Documentation
+README.md
+CHANGELOG.md
+CONTRIBUTING.md
+LICENSE
+*.md
+docs/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Testing
+__tests__
+test
+tests
+*.test.js
+*.test.ts
+*.test.jsx
+*.test.tsx
+*.spec.js
+*.spec.ts
+*.spec.jsx
+*.spec.tsx
+coverage
+.nyc_output
+jest.config.js
+vitest.config.js
+
+# Build output
+dist
+build
+out
+.next
+*.tgz
+
+# IDE and editor
+.vscode
+.idea
+*.swp
+*.swo
+*~
+.editorconfig
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# CI/CD configs (not needed in images)
+.github/workflows
+scripts/deploy.sh
+scripts/build-images.sh
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Infrastructure
+infrastructure/
+prometheus/
+nginx/
+
+# Logs
+logs
+*.log

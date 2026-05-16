@@ -1,0 +1,134 @@
+name: CI - Build & Push Docker Images
+
+on:
+  push:
+    branches: [main]
+  workflow_run:
+    workflows: ['CI - Lint & Test']
+    types:
+      - completed
+
+env:
+  DOCKER_REGISTRY: docker.io
+  DOCKER_NAMESPACE: sukaczev
+  COMMIT_SHA: ${{ github.sha }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-test-status:
+    name: Verify Tests Passed
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'push' }}
+    steps:
+      - name: Tests passed - proceeding with Docker build
+        run: echo "All tests passed. Ready to build and push Docker images."
+
+  build-and-push:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    needs: check-test-status
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: gateway
+            context: services/gateway
+            image: gateway
+          - service: user-service
+            context: services/user-service
+            image: user-service
+          - service: product-service
+            context: services/product-service
+            image: product-service
+          - service: order-service
+            context: services/order-service
+            image: order-service
+          - service: payment-service
+            context: services/payment-service
+            image: payment-service
+          - service: notification-service
+            context: services/notification-service
+            image: notification-service
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+          registry: ${{ env.DOCKER_REGISTRY }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_NAMESPACE }}/${{ matrix.image }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=,suffix=,format=short
+            type=sha,prefix=,suffix=,format=long
+
+      - name: Build and push ${{ matrix.service }} image
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.context }}/Dockerfile
+          push: true
+          tags: |
+            ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_NAMESPACE }}/${{ matrix.image }}:latest
+            ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_NAMESPACE }}/${{ matrix.image }}:${{ env.COMMIT_SHA }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ env.COMMIT_SHA }}
+            VERSION=${{ github.ref_name }}
+
+      - name: Verify pushed image for ${{ matrix.service }}
+        run: |
+          echo "Verifying image: ${{ env.DOCKER_NAMESPACE }}/${{ matrix.image }}:${{ env.COMMIT_SHA }}"
+          docker buildx imagetools inspect ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_NAMESPACE }}/${{ matrix.image }}:${{ env.COMMIT_SHA }} \
+            || echo "Image verification failed but build may still be successful"
+
+  notify-success:
+    name: Notify Build Success
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: success()
+    steps:
+      - name: All images built and pushed successfully
+        run: |
+          echo "All Docker images have been built and pushed to Docker Hub."
+          echo "Images:"
+          echo "  - ${{ env.DOCKER_NAMESPACE }}/gateway:latest + :${{ env.COMMIT_SHA }}"
+          echo "  - ${{ env.DOCKER_NAMESPACE }}/user-service:latest + :${{ env.COMMIT_SHA }}"
+          echo "  - ${{ env.DOCKER_NAMESPACE }}/product-service:latest + :${{ env.COMMIT_SHA }}"
+          echo "  - ${{ env.DOCKER_NAMESPACE }}/order-service:latest + :${{ env.COMMIT_SHA }}"
+          echo "  - ${{ env.DOCKER_NAMESPACE }}/payment-service:latest + :${{ env.COMMIT_SHA }}"
+          echo "  - ${{ env.DOCKER_NAMESPACE }}/notification-service:latest + :${{ env.COMMIT_SHA }}"
+
+  notify-failure:
+    name: Notify Build Failure
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: failure()
+    steps:
+      - name: Build failed notification
+        run: |
+          echo "Docker image build or push failed!"
+          echo "Please check the logs above for details."

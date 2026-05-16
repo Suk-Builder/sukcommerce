@@ -600,11 +600,15 @@ app.use(errorHandler);
 
 // ============ 启动服务 ============
 const PORT = process.env.PORT || 3002;
-initES().then(() => {
-  app.listen(PORT, () => {
-    logger.info(`Product Service running on port ${PORT}`);
+if (require.main === module) {
+  initES().then(() => {
+    app.listen(PORT, () => {
+      logger.info(`Product Service running on port ${PORT}`);
+    });
+  }).catch(err => {
+    logger.error('Failed to initialize:', err);
+    process.exit(1);
   });
-}).catch(err => {
-  logger.error('Failed to initialize:', err);
-  process.exit(1);
-});
+}
+
+module.exports = app;
