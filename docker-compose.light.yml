@@ -1,0 +1,221 @@
+#############################################
+# SukCommerce — 精简版（适合 2-4G 内存服务器）
+# 移除非核心组件，保留业务服务
+#############################################
+version: '3.8'
+
+networks:
+  sukcommerce:
+    driver: bridge
+
+services:
+  # ─── 单个 PostgreSQL（所有服务共用）───
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-postgres123}
+      - POSTGRES_DB=sukcommerce
+    volumes:
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - pg-data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    networks:
+      - sukcommerce
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ─── Redis ───
+  redis:
+    image: redis:7-alpine
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    networks:
+      - sukcommerce
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ─── RabbitMQ（内存限制）───
+  rabbitmq:
+    image: rabbitmq:3-alpine
+    environment:
+      - RABBITMQ_DEFAULT_USER=admin
+      - RABBITMQ_DEFAULT_PASS=${RABBITMQ_PASSWORD:-admin123}
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    ports:
+      - "127.0.0.1:5672:5672"
+    networks:
+      - sukcommerce
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ─── Gateway ───
+  gateway:
+    build: ./services/gateway
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - USER_SERVICE_URL=http://user-service:3001
+      - PRODUCT_SERVICE_URL=http://product-service:3002
+      - ORDER_SERVICE_URL=http://order-service:3003
+      - PAYMENT_SERVICE_URL=http://payment-service:3004
+      - NOTIFICATION_SERVICE_URL=http://notification-service:3005
+      - JWT_SECRET=${JWT_SECRET:-default-jwt-secret-change-me}
+      - REDIS_URL=redis://redis:6379
+      - RATE_LIMIT_WINDOW=60000
+      - RATE_LIMIT_MAX=100
+    ports:
+      - "3000:3000"
+    depends_on:
+      - redis
+      - rabbitmq
+    networks:
+      - sukcommerce
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ─── User Service ───
+  user-service:
+    build: ./services/user-service
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+      - DB_HOST=postgres
+      - DB_NAME=sukcommerce
+      - DB_USER=postgres
+      - DB_PASSWORD=${DB_PASSWORD:-postgres123}
+      - JWT_SECRET=${JWT_SECRET:-default-jwt-secret-change-me}
+      - REDIS_URL=redis://redis:6379
+      - RABBITMQ_URL=amqp://admin:${RABBITMQ_PASSWORD:-admin123}@rabbitmq:5672
+      - SERVICE_NAME=user-service
+    depends_on:
+      - postgres
+      - redis
+      - rabbitmq
+    networks:
+      - sukcommerce
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ─── Product Service ───
+  product-service:
+    build: ./services/product-service
+    environment:
+      - NODE_ENV=production
+      - PORT=3002
+      - DB_HOST=postgres
+      - DB_NAME=sukcommerce
+      - DB_USER=postgres
+      - DB_PASSWORD=${DB_PASSWORD:-postgres123}
+      - ES_HOST=disabled
+      - REDIS_URL=redis://redis:6379
+      - RABBITMQ_URL=amqp://admin:${RABBITMQ_PASSWORD:-admin123}@rabbitmq:5672
+      - SERVICE_NAME=product-service
+    depends_on:
+      - postgres
+      - redis
+      - rabbitmq
+    networks:
+      - sukcommerce
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ─── Order Service ───
+  order-service:
+    build: ./services/order-service
+    environment:
+      - NODE_ENV=production
+      - PORT=3003
+      - DB_HOST=postgres
+      - DB_NAME=sukcommerce
+      - DB_USER=postgres
+      - DB_PASSWORD=${DB_PASSWORD:-postgres123}
+      - REDIS_URL=redis://redis:6379
+      - RABBITMQ_URL=amqp://admin:${RABBITMQ_PASSWORD:-admin123}@rabbitmq:5672
+      - PRODUCT_SERVICE_URL=http://product-service:3002
+      - PAYMENT_SERVICE_URL=http://payment-service:3004
+      - SERVICE_NAME=order-service
+    depends_on:
+      - postgres
+      - redis
+      - rabbitmq
+    networks:
+      - sukcommerce
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ─── Payment Service ───
+  payment-service:
+    build: ./services/payment-service
+    environment:
+      - NODE_ENV=production
+      - PORT=3004
+      - DB_HOST=postgres
+      - DB_NAME=sukcommerce
+      - DB_USER=postgres
+      - DB_PASSWORD=${DB_PASSWORD:-postgres123}
+      - RABBITMQ_URL=amqp://admin:${RABBITMQ_PASSWORD:-admin123}@rabbitmq:5672
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-}
+      - SERVICE_NAME=payment-service
+    depends_on:
+      - postgres
+      - rabbitmq
+    networks:
+      - sukcommerce
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ─── Notification Service ───
+  notification-service:
+    build: ./services/notification-service
+    environment:
+      - NODE_ENV=production
+      - PORT=3005
+      - RABBITMQ_URL=amqp://admin:${RABBITMQ_PASSWORD:-admin123}@rabbitmq:5672
+      - SMTP_HOST=${SMTP_HOST:-}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASS=${SMTP_PASS:-}
+      - SERVICE_NAME=notification-service
+    depends_on:
+      - rabbitmq
+    networks:
+      - sukcommerce
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+volumes:
+  pg-data:
+  redis-data:
+  rabbitmq-data:
