@@ -1,44 +1,31 @@
-#############################################
-# SukCommerce — 微服务电商SaaS平台
-# Docker Compose 生产编排
-#############################################
 version: '3.8'
 
-networks:
-  sukcommerce:
-    driver: bridge
-
-volumes:
-  postgres-user:
-  postgres-product:
-  postgres-order:
-  redis-data:
-  es-data:
-  rabbitmq-data:
-  prometheus-data:
-  grafana-data:
-
 services:
-  # ─── API Gateway ───
+  # ─── Nginx ────────────────────────────────────────────────────────────
   nginx:
     image: nginx:alpine
+    container_name: nginx
     ports:
       - "80:80"
       - "443:443"
     volumes:
       - ./infrastructure/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./infrastructure/nginx/ssl:/etc/nginx/ssl:ro
-    depends_on:
-      - gateway
+      - static_files:/var/www/static:ro
+      - nginx_logs:/var/log/nginx
     networks:
       - sukcommerce
-    restart: always
+    depends_on:
+      - gateway
+    restart: unless-stopped
 
-  # ─── 服务网关 ───
+  # ─── API Gateway (x2) ─────────────────────────────────────────────────
   gateway:
-    build: ./services/gateway
+    build:
+      context: ./services/gateway
+      dockerfile: Dockerfile
+    container_name: gateway
     environment:
-      - NODE_ENV=production
       - PORT=3000
       - USER_SERVICE_URL=http://user-service:3001
       - PRODUCT_SERVICE_URL=http://product-service:3002
@@ -47,221 +34,307 @@ services:
       - NOTIFICATION_SERVICE_URL=http://notification-service:3005
       - JWT_SECRET=${JWT_SECRET}
       - REDIS_URL=redis://redis:6379
-      - RATE_LIMIT_WINDOW=60000
-      - RATE_LIMIT_MAX=100
-    depends_on:
-      - redis
-      - rabbitmq
+    ports:
+      - "3000:3000"
     networks:
       - sukcommerce
-    restart: always
+    depends_on:
+      - redis
+    restart: unless-stopped
     deploy:
       replicas: 2
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('node-fetch')('http://localhost:3000/health').then(r => {if(!r.ok) throw new Error('unhealthy')})"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
-  # ─── 用户服务 ───
+  # ─── User Service ─────────────────────────────────────────────────────
   user-service:
-    build: ./services/user-service
+    image: node:18-alpine
+    container_name: user-service
     environment:
-      - NODE_ENV=production
       - PORT=3001
-      - DB_HOST=postgres-user
-      - DB_PORT=5432
-      - DB_NAME=userdb
-      - DB_USER=postgres
-      - DB_PASSWORD=${DB_PASSWORD}
-      - JWT_SECRET=${JWT_SECRET}
+      - DATABASE_URL=postgres://postgres:postgres@postgres-user:5432/user_db
       - REDIS_URL=redis://redis:6379
-      - RABBITMQ_URL=amqp://rabbitmq:5672
+      - JWT_SECRET=${JWT_SECRET}
+    ports:
+      - "3001:3001"
+    networks:
+      - sukcommerce
     depends_on:
       - postgres-user
       - redis
-      - rabbitmq
+    restart: unless-stopped
+
+  # ─── Product Service ──────────────────────────────────────────────────
+  product-service:
+    image: node:18-alpine
+    container_name: product-service
+    environment:
+      - PORT=3002
+      - DATABASE_URL=postgres://postgres:postgres@postgres-product:5432/product_db
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+      - REDIS_URL=redis://redis:6379
+    ports:
+      - "3002:3002"
     networks:
       - sukcommerce
-    restart: always
-    deploy:
-      replicas: 2
-
-  # ─── 商品服务 ───
-  product-service:
-    build: ./services/product-service
-    environment:
-      - NODE_ENV=production
-      - PORT=3002
-      - DB_HOST=postgres-product
-      - DB_PORT=5432
-      - DB_NAME=productdb
-      - DB_USER=postgres
-      - DB_PASSWORD=${DB_PASSWORD}
-      - ES_HOST=elasticsearch:9200
-      - REDIS_URL=redis://redis:6379
-      - RABBITMQ_URL=amqp://rabbitmq:5672
     depends_on:
       - postgres-product
       - elasticsearch
       - redis
-      - rabbitmq
-    networks:
-      - sukcommerce
-    restart: always
-    deploy:
-      replicas: 2
+    restart: unless-stopped
 
-  # ─── 订单服务 ───
+  # ─── Order Service ────────────────────────────────────────────────────
   order-service:
-    build: ./services/order-service
+    image: node:18-alpine
+    container_name: order-service
     environment:
-      - NODE_ENV=production
       - PORT=3003
-      - DB_HOST=postgres-order
-      - DB_PORT=5432
-      - DB_NAME=orderdb
-      - DB_USER=postgres
-      - DB_PASSWORD=${DB_PASSWORD}
+      - DATABASE_URL=postgres://postgres:postgres@postgres-order:5432/order_db
       - REDIS_URL=redis://redis:6379
       - RABBITMQ_URL=amqp://rabbitmq:5672
-      - PRODUCT_SERVICE_URL=http://product-service:3002
-      - PAYMENT_SERVICE_URL=http://payment-service:3004
-      - USER_SERVICE_URL=http://user-service:3001
+    ports:
+      - "3003:3003"
+    networks:
+      - sukcommerce
     depends_on:
       - postgres-order
       - redis
       - rabbitmq
+    restart: unless-stopped
+
+  # ─── Payment Service ──────────────────────────────────────────────────
+  payment-service:
+    image: node:18-alpine
+    container_name: payment-service
+    environment:
+      - PORT=3004
+      - DATABASE_URL=postgres://postgres:postgres@postgres-order:5432/payment_db
+      - REDIS_URL=redis://redis:6379
+      - RABBITMQ_URL=amqp://rabbitmq:5672
+    ports:
+      - "3004:3004"
     networks:
       - sukcommerce
-    restart: always
-    deploy:
-      replicas: 2
-
-  # ─── 支付服务 ───
-  payment-service:
-    build: ./services/payment-service
-    environment:
-      - NODE_ENV=production
-      - PORT=3004
-      - DB_HOST=postgres-order
-      - DB_PORT=5432
-      - DB_NAME=paymentdb
-      - DB_USER=postgres
-      - DB_PASSWORD=${DB_PASSWORD}
-      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
-      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET}
-      - ALIPAY_APP_ID=${ALIPAY_APP_ID}
-      - ALIPAY_PRIVATE_KEY=${ALIPAY_PRIVATE_KEY}
-      - RABBITMQ_URL=amqp://rabbitmq:5672
     depends_on:
       - postgres-order
+      - redis
       - rabbitmq
-    networks:
-      - sukcommerce
-    restart: always
+    restart: unless-stopped
 
-  # ─── 通知服务 ───
+  # ─── Notification Service ─────────────────────────────────────────────
   notification-service:
-    build: ./services/notification-service
+    image: node:18-alpine
+    container_name: notification-service
     environment:
-      - NODE_ENV=production
       - PORT=3005
+      - REDIS_URL=redis://redis:6379
       - RABBITMQ_URL=amqp://rabbitmq:5672
-      - SMTP_HOST=${SMTP_HOST}
-      - SMTP_USER=${SMTP_USER}
-      - SMTP_PASS=${SMTP_PASS}
-      - SMS_ACCESS_KEY=${SMS_ACCESS_KEY}
-      - SMS_SECRET_KEY=${SMS_SECRET_KEY}
-    depends_on:
-      - rabbitmq
+    ports:
+      - "3005:3005"
     networks:
       - sukcommerce
-    restart: always
+    depends_on:
+      - redis
+      - rabbitmq
+    restart: unless-stopped
 
-  # ─── 数据库 ───
+  # ─── PostgreSQL: User ─────────────────────────────────────────────────
   postgres-user:
     image: postgres:15-alpine
+    container_name: postgres-user
     environment:
-      - POSTGRES_DB=userdb
       - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=user_db
     volumes:
-      - postgres-user:/var/lib/postgresql/data
+      - postgres_user_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
     networks:
       - sukcommerce
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
+  # ─── PostgreSQL: Product ──────────────────────────────────────────────
   postgres-product:
     image: postgres:15-alpine
+    container_name: postgres-product
     environment:
-      - POSTGRES_DB=productdb
       - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=product_db
     volumes:
-      - postgres-product:/var/lib/postgresql/data
+      - postgres_product_data:/var/lib/postgresql/data
+    ports:
+      - "5434:5432"
     networks:
       - sukcommerce
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
+  # ─── PostgreSQL: Order/Payment ────────────────────────────────────────
   postgres-order:
     image: postgres:15-alpine
+    container_name: postgres-order
     environment:
-      - POSTGRES_DB=orderdb
       - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=order_db
     volumes:
-      - postgres-order:/var/lib/postgresql/data
+      - postgres_order_data:/var/lib/postgresql/data
+    ports:
+      - "5435:5432"
     networks:
       - sukcommerce
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-  # ─── Redis ───
+  # ─── Redis ────────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    container_name: redis
     volumes:
-      - redis-data:/data
+      - redis_data:/data
+    ports:
+      - "6379:6379"
     networks:
       - sukcommerce
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
 
-  # ─── Elasticsearch ───
+  # ─── Elasticsearch ────────────────────────────────────────────────────
   elasticsearch:
-    image: elasticsearch:8.11.0
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: elasticsearch
     environment:
       - discovery.type=single-node
       - xpack.security.enabled=false
-      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - ES_JAVA_OPTS=-Xms256m -Xmx256m
+      - bootstrap.memory_lock=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
     volumes:
-      - es-data:/usr/share/elasticsearch/data
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
     networks:
       - sukcommerce
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
 
-  # ─── RabbitMQ ───
+  # ─── RabbitMQ ─────────────────────────────────────────────────────────
   rabbitmq:
-    image: rabbitmq:3-alpine-management
+    image: rabbitmq:3-management-alpine
+    container_name: rabbitmq
     environment:
       - RABBITMQ_DEFAULT_USER=admin
-      - RABBITMQ_DEFAULT_PASS=${RABBITMQ_PASSWORD}
+      - RABBITMQ_DEFAULT_PASS=admin
     volumes:
-      - rabbitmq-data:/var/lib/rabbitmq
+      - rabbitmq_data:/var/lib/rabbitmq
     ports:
-      - "15672:15672"  # 管理界面
+      - "5672:5672"
+      - "15672:15672"
     networks:
       - sukcommerce
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
 
-  # ─── 监控 ───
+  # ─── Prometheus ───────────────────────────────────────────────────────
   prometheus:
     image: prom/prometheus:latest
+    container_name: prometheus
     volumes:
       - ./infrastructure/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus-data:/prometheus
+      - prometheus_data:/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    ports:
+      - "9090:9090"
     networks:
       - sukcommerce
+    restart: unless-stopped
 
+  # ─── Grafana ──────────────────────────────────────────────────────────
   grafana:
     image: grafana/grafana:latest
-    ports:
-      - "3000:3000"
+    container_name: grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SERVER_ROOT_URL=http://localhost:3100
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
     volumes:
-      - grafana-data:/var/lib/grafana
-      - ./infrastructure/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
-    depends_on:
-      - prometheus
+      - grafana_data:/var/lib/grafana
+      - ./infrastructure/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3100:3000"
     networks:
       - sukcommerce
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+# ─── Networks ───────────────────────────────────────────────────────────
+networks:
+  sukcommerce:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# ─── Volumes ────────────────────────────────────────────────────────────
+volumes:
+  postgres_user_data:
+    driver: local
+  postgres_product_data:
+    driver: local
+  postgres_order_data:
+    driver: local
+  redis_data:
+    driver: local
+  elasticsearch_data:
+    driver: local
+  rabbitmq_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  static_files:
+    driver: local
+  nginx_logs:
+    driver: local

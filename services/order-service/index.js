@@ -1,235 +1,486 @@
-/**
- * 订单服务 — 购物车/订单/Saga分布式事务
- * PostgreSQL + Redis(分布式锁) + RabbitMQ Saga协调
- */
 require('dotenv').config();
 const express = require('express');
-const { Pool } = require('pg');
-const Redis = require('ioredis');
-const axios = require('axios');
+const cors = require('cors');
 
 const { createLogger, requestIdMiddleware } = require('../../shared/lib/logger');
 const { Errors, errorHandler } = require('../../shared/lib/errors');
 const { EventBus, EventTypes } = require('../../shared/lib/events');
+const { getPool, query, transaction } = require('../../shared/lib/db');
 const { OrderSaga } = require('./sagas/order-saga');
 
-const logger = createLogger();
+const logger = createLogger('order-service');
 const app = express();
+const PORT = process.env.PORT || 3003;
+
+app.use(cors());
 app.use(express.json());
 app.use(requestIdMiddleware);
 
-const pool = new Pool({ host: process.env.DB_HOST, port: process.env.DB_PORT, database: process.env.DB_NAME, user: process.env.DB_USER, password: process.env.DB_PASSWORD, max: 20 });
-const redis = new Redis(process.env.REDIS_URL);
-const eventBus = new EventBus();
-eventBus.connect();
+const getUserId = (req) => {
+  const uid = req.headers['x-user-id'];
+  if (!uid) throw new Errors.UnauthorizedError('Missing X-User-Id header');
+  return parseInt(uid, 10);
+};
 
-// ─── DB ───
-async function initDb() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS carts (
-      id BIGSERIAL PRIMARY KEY,
-      user_id BIGINT NOT NULL,
-      product_id BIGINT NOT NULL,
-      sku_id BIGINT,
-      quantity INT NOT NULL DEFAULT 1,
-      selected BOOLEAN DEFAULT TRUE,
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW(),
-      UNIQUE(user_id, product_id, sku_id)
-    );
+const generateOrderNo = () => {
+  const now = new Date();
+  const ymd = now.toISOString().slice(0, 10).replace(/-/g, '');
+  const rand = Math.floor(100000 + Math.random() * 900000);
+  return `SC${ymd}${rand}`;
+};
 
-    CREATE TABLE IF NOT EXISTS orders (
-      id BIGSERIAL PRIMARY KEY,
-      order_no VARCHAR(32) UNIQUE NOT NULL,
-      user_id BIGINT NOT NULL,
-      status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending','paid','shipped','completed','cancelled','refunding','refunded')),
-      total_amount DECIMAL(12,2) NOT NULL,
-      discount_amount DECIMAL(12,2) DEFAULT 0,
-      pay_amount DECIMAL(12,2) NOT NULL,
-      address JSONB NOT NULL,
-      remark TEXT,
-      paid_at TIMESTAMPTZ,
-      shipped_at TIMESTAMPTZ,
-      completed_at TIMESTAMPTZ,
-      saga_id VARCHAR(64),
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
+// ── Cart Routes ──
 
-    CREATE TABLE IF NOT EXISTS order_items (
-      id BIGSERIAL PRIMARY KEY,
-      order_id BIGINT REFERENCES orders(id),
-      product_id BIGINT NOT NULL,
-      sku_id BIGINT,
-      product_name VARCHAR(255) NOT NULL,
-      sku_attrs JSONB,
-      price DECIMAL(12,2) NOT NULL,
-      quantity INT NOT NULL,
-      subtotal DECIMAL(12,2) NOT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
-    CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
-    CREATE INDEX IF NOT EXISTS idx_orders_no ON orders(order_no);
-  `);
-}
-
-// ─── 生成订单号 ───
-function generateOrderNo() {
-  const date = new Date().toISOString().slice(0,10).replace(/-/g,'');
-  const rand = Math.random().toString(36).slice(2,8).toUpperCase();
-  return `SC${date}${rand}`;
-}
-
-// ─── 路由 ───
-
-// 购物车
 app.get('/cart', async (req, res, next) => {
   try {
-    const userId = req.headers['x-user-id'];
-    const result = await pool.query(
-      `SELECT c.*, p.name as product_name, p.images[1] as image, p.status as product_status
-       FROM carts c JOIN products p ON c.product_id = p.id WHERE c.user_id = $1`,
+    const userId = getUserId(req);
+    const rows = await query(
+      `SELECT c.*, p.name AS product_name, p.image AS product_image
+       FROM carts c
+       JOIN products p ON p.id = c.product_id
+       WHERE c.user_id = $1
+       ORDER BY c.created_at DESC`,
       [userId]
     );
-    res.json({ items: result.rows });
-  } catch (err) { next(err); }
+    res.json({ data: rows });
+  } catch (err) {
+    next(err);
+  }
 });
 
 app.post('/cart', async (req, res, next) => {
   try {
-    const userId = req.headers['x-user-id'];
+    const userId = getUserId(req);
     const { product_id, sku_id, quantity = 1 } = req.body;
-    await pool.query(
-      `INSERT INTO carts (user_id, product_id, sku_id, quantity) VALUES ($1,$2,$3,$4)
-       ON CONFLICT (user_id, product_id, sku_id) DO UPDATE SET quantity = carts.quantity + $4, updated_at = NOW()`,
-      [userId, product_id, sku_id, quantity]
+
+    if (!product_id) throw new Errors.ValidationError('product_id is required');
+
+    const result = await query(
+      `INSERT INTO carts (user_id, product_id, sku_id, quantity, selected, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, TRUE, NOW(), NOW())
+       ON CONFLICT (user_id, product_id, COALESCE(sku_id, 0))
+       DO UPDATE SET quantity = carts.quantity + EXCLUDED.quantity,
+                     updated_at = NOW()
+       RETURNING *`,
+      [userId, product_id, sku_id || null, quantity]
     );
-    res.status(201).json({ message: '已加入购物车' });
-  } catch (err) { next(err); }
+
+    res.status(201).json({ data: result[0] });
+  } catch (err) {
+    next(err);
+  }
 });
 
-// 创建订单 —— Saga 分布式事务入口
-app.post('/orders', async (req, res, next) => {
+app.put('/cart/:id', async (req, res, next) => {
   try {
-    const userId = req.headers['x-user-id'];
-    const { address, remark, cart_item_ids } = req.body;
+    const userId = getUserId(req);
+    const { id } = req.params;
+    const { quantity, selected } = req.body;
 
-    // 1. 获取购物车商品
-    const cartResult = await pool.query(
-      'SELECT c.*, p.name, p.price, p.stock FROM carts c JOIN products p ON c.product_id = p.id WHERE c.user_id = $1 AND c.selected = TRUE',
+    const updates = ['updated_at = NOW()'];
+    const params = [];
+    let idx = 1;
+
+    if (quantity !== undefined) {
+      updates.push(`quantity = $${idx++}`);
+      params.push(quantity);
+    }
+    if (selected !== undefined) {
+      updates.push(`selected = $${idx++}`);
+      params.push(selected);
+    }
+    params.push(id, userId);
+
+    const result = await query(
+      `UPDATE carts SET ${updates.join(', ')} WHERE id = $${idx++} AND user_id = $${idx} RETURNING *`,
+      params
+    );
+
+    if (!result.length) throw new Errors.NotFoundError('Cart item not found');
+    res.json({ data: result[0] });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.delete('/cart/:id', async (req, res, next) => {
+  try {
+    const userId = getUserId(req);
+    const { id } = req.params;
+
+    const result = await query(
+      'DELETE FROM carts WHERE id = $1 AND user_id = $2 RETURNING *',
+      [id, userId]
+    );
+
+    if (!result.length) throw new Errors.NotFoundError('Cart item not found');
+    res.json({ data: result[0] });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.delete('/cart', async (req, res, next) => {
+  try {
+    const userId = getUserId(req);
+    const result = await query(
+      'DELETE FROM carts WHERE user_id = $1 AND selected = TRUE RETURNING *',
       [userId]
     );
-    const items = cartResult.rows;
-    if (items.length === 0) throw Errors.CART_EMPTY();
-
-    // 2. 计算金额
-    const totalAmount = items.reduce((sum, i) => sum + (parseFloat(i.price) * i.quantity), 0);
-
-    // 3. 创建订单（pending状态）
-    const orderNo = generateOrderNo();
-    const sagaId = `saga_${orderNo}`;
-    const client = await pool.connect();
-
-    let order;
-    try {
-      await client.query('BEGIN');
-
-      const orderResult = await client.query(
-        `INSERT INTO orders (order_no, user_id, status, total_amount, pay_amount, address, remark, saga_id)
-         VALUES ($1,$2,'pending',$3,$4,$5,$6,$7) RETURNING *`,
-        [orderNo, userId, totalAmount, totalAmount, JSON.stringify(address), remark, sagaId]
-      );
-      order = orderResult.rows[0];
-
-      for (const item of items) {
-        await client.query(
-          `INSERT INTO order_items (order_id, product_id, sku_id, product_name, price, quantity, subtotal)
-           VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-          [order.id, item.product_id, item.sku_id, item.product_name, item.price, item.quantity, item.price * item.quantity]
-        );
-      }
-
-      await client.query('COMMIT');
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
-    }
-
-    // 4. 启动 Saga 分布式事务
-    const saga = new OrderSaga({ sagaId, order, items, eventBus, pool });
-    saga.execute().catch(err => logger.error(`Saga failed: ${sagaId}`, err));
-
-    await eventBus.publish(EventTypes.ORDER_CREATED, { order_id: order.id, order_no, user_id: userId, amount: totalAmount });
-
-    res.status(201).json({ order: { ...order, items } });
-  } catch (err) { next(err); }
+    res.json({ deleted: result.length, data: result });
+  } catch (err) {
+    next(err);
+  }
 });
 
-// 获取订单
+// ── Order Routes ──
+
+app.post('/orders', async (req, res, next) => {
+  try {
+    const userId = getUserId(req);
+    const { address, remark } = req.body;
+
+    if (!address) throw new Errors.ValidationError('address is required');
+
+    // Get selected cart items
+    const cartItems = await query(
+      `SELECT c.*, p.name AS product_name, p.price AS product_price,
+              COALESCE(s.price, p.price) AS final_price,
+              s.attrs AS sku_attrs
+       FROM carts c
+       JOIN products p ON p.id = c.product_id
+       LEFT JOIN skus s ON s.id = c.sku_id
+       WHERE c.user_id = $1 AND c.selected = TRUE`,
+      [userId]
+    );
+
+    if (!cartItems.length) {
+      throw new Errors.ValidationError('No items selected in cart');
+    }
+
+    // Calculate totals
+    let totalAmount = 0;
+    const orderItems = cartItems.map((c) => {
+      const price = parseFloat(c.final_price);
+      const subtotal = price * c.quantity;
+      totalAmount += subtotal;
+      return {
+        product_id: c.product_id,
+        sku_id: c.sku_id,
+        product_name: c.product_name,
+        sku_attrs: c.sku_attrs,
+        price,
+        quantity: c.quantity,
+        subtotal,
+      };
+    });
+
+    const discountAmount = 0;
+    const payAmount = totalAmount - discountAmount;
+    const orderNo = generateOrderNo();
+    const sagaId = `saga_${orderNo}`;
+
+    // Create order + items in transaction
+    const order = await transaction(async (client) => {
+      const orderRes = await client.query(
+        `INSERT INTO orders (order_no, user_id, status, total_amount, discount_amount, pay_amount, address, remark, saga_id, created_at, updated_at)
+         VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, NOW(), NOW()) RETURNING *`,
+        [orderNo, userId, totalAmount, discountAmount, payAmount, JSON.stringify(address), remark || null, sagaId]
+      );
+      const newOrder = orderRes.rows[0];
+
+      const itemValues = orderItems.map((_, i) =>
+        `($1, $${i * 6 + 2}, $${i * 6 + 3}, $${i * 6 + 4}, $${i * 6 + 5}, $${i * 6 + 6}, $${i * 6 + 7})`
+      ).join(', ');
+
+      const itemParams = orderItems.flatMap((item) => [
+        item.product_id,
+        item.sku_id,
+        item.product_name,
+        item.sku_attrs ? JSON.stringify(item.sku_attrs) : null,
+        item.price,
+        item.quantity,
+        item.subtotal,
+      ]);
+
+      await client.query(
+        `INSERT INTO order_items (order_id, product_id, sku_id, product_name, sku_attrs, price, quantity, subtotal)
+         VALUES ${itemValues}`,
+        [newOrder.id, ...itemParams]
+      );
+
+      return newOrder;
+    });
+
+    // Fetch created items
+    const items = await query(
+      'SELECT * FROM order_items WHERE order_id = $1',
+      [order.id]
+    );
+
+    // Publish event
+    const eventBus = await EventBus.getInstance();
+    await eventBus.publish(EventTypes.ORDER_CREATED, {
+      orderId: order.id,
+      orderNo: order.order_no,
+      userId,
+      sagaId,
+      totalAmount,
+      payAmount,
+      itemCount: items.length,
+    });
+
+    // Start Saga asynchronously
+    const saga = new OrderSaga({ sagaId, order, items, userId });
+    saga.execute().catch((err) => {
+      logger.error('Saga execution error', { sagaId, error: err.message });
+    });
+
+    res.status(201).json({ order, items });
+  } catch (err) {
+    next(err);
+  }
+});
+
 app.get('/orders', async (req, res, next) => {
   try {
-    const userId = req.headers['x-user-id'];
-    const { status, page = 1, limit = 10 } = req.query;
-    let sql = 'SELECT * FROM orders WHERE user_id = $1';
+    const userId = getUserId(req);
+    const { status, page = 1, limit = 20 } = req.query;
+    const offset = (parseInt(page, 10) - 1) * parseInt(limit, 10);
     const params = [userId];
-    if (status) { sql += ' AND status = $2'; params.push(status); }
-    sql += ' ORDER BY created_at DESC LIMIT $' + (params.length + 1) + ' OFFSET $' + (params.length + 2);
-    params.push(limit, (page - 1) * limit);
+    let where = 'WHERE o.user_id = $1';
 
-    const result = await pool.query(sql, params);
-    res.json({ orders: result.rows });
-  } catch (err) { next(err); }
+    if (status) {
+      where += ` AND o.status = $${params.length + 1}`;
+      params.push(status);
+    }
+
+    const countRes = await query(`SELECT COUNT(*) FROM orders o ${where}`, params);
+    const total = parseInt(countRes[0].count, 10);
+
+    params.push(parseInt(limit, 10), offset);
+    const rows = await query(
+      `SELECT o.*,
+        (SELECT json_agg(oi.*) FROM order_items oi WHERE oi.order_id = o.id) AS items
+       FROM orders o ${where}
+       ORDER BY o.created_at DESC
+       LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      params
+    );
+
+    res.json({ data: rows, pagination: { page: parseInt(page, 10), limit: parseInt(limit, 10), total } });
+  } catch (err) {
+    next(err);
+  }
 });
 
 app.get('/orders/:id', async (req, res, next) => {
   try {
-    const userId = req.headers['x-user-id'];
-    const orderResult = await pool.query('SELECT * FROM orders WHERE id = $1 AND user_id = $2', [req.params.id, userId]);
-    if (!orderResult.rows[0]) throw Errors.ORDER_NOT_FOUND();
-    const itemsResult = await pool.query('SELECT * FROM order_items WHERE order_id = $1', [req.params.id]);
-    res.json({ order: { ...orderResult.rows[0], items: itemsResult.rows } });
-  } catch (err) { next(err); }
+    const userId = getUserId(req);
+    const { id } = req.params;
+
+    const orderRes = await query(
+      'SELECT * FROM orders WHERE id = $1 AND user_id = $2',
+      [id, userId]
+    );
+    if (!orderRes.length) throw new Errors.NotFoundError('Order not found');
+
+    const items = await query(
+      'SELECT * FROM order_items WHERE order_id = $1',
+      [id]
+    );
+
+    res.json({ order: orderRes[0], items });
+  } catch (err) {
+    next(err);
+  }
 });
 
-// 取消订单
 app.put('/orders/:id/cancel', async (req, res, next) => {
   try {
-    const userId = req.headers['x-user-id'];
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      const result = await client.query('SELECT status FROM orders WHERE id = $1 AND user_id = $2 FOR UPDATE', [req.params.id, userId]);
-      if (!result.rows[0]) throw Errors.ORDER_NOT_FOUND();
-      if (!['pending', 'paid'].includes(result.rows[0].status)) throw Errors.ORDER_CANNOT_CANCEL();
+    const userId = getUserId(req);
+    const { id } = req.params;
+    const { reason } = req.body;
 
-      await client.query("UPDATE orders SET status = 'cancelled', updated_at = NOW() WHERE id = $1", [req.params.id]);
+    const orderRes = await query(
+      'SELECT * FROM orders WHERE id = $1 AND user_id = $2',
+      [id, userId]
+    );
+    if (!orderRes.length) throw new Errors.NotFoundError('Order not found');
 
-      // 恢复库存
-      const items = await client.query('SELECT * FROM order_items WHERE order_id = $1', [req.params.id]);
-      for (const item of items.rows) {
-        await client.query('UPDATE products SET stock = stock + $1 WHERE id = $2', [item.quantity, item.product_id]);
+    const order = orderRes[0];
+    if (!['pending', 'paid'].includes(order.status)) {
+      throw new Errors.ValidationError(`Cannot cancel order in status: ${order.status}`);
+    }
+
+    const items = await query(
+      'SELECT * FROM order_items WHERE order_id = $1',
+      [id]
+    );
+
+    await transaction(async (client) => {
+      // Restore stock
+      for (const item of items) {
+        await client.query(
+          'UPDATE products SET stock = stock + $1, updated_at = NOW() WHERE id = $2',
+          [item.quantity, item.product_id]
+        );
       }
 
-      await client.query('COMMIT');
+      // Update order status
+      await client.query(
+        `UPDATE orders SET status = 'cancelled', updated_at = NOW() WHERE id = $1`,
+        [id]
+      );
+    });
 
-      await eventBus.publish(EventTypes.ORDER_CANCELLED, { order_id: req.params.id });
-      res.json({ message: '订单已取消' });
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
-    }
-  } catch (err) { next(err); }
+    const eventBus = await EventBus.getInstance();
+    await eventBus.publish(EventTypes.ORDER_CANCELLED, {
+      orderId: order.id,
+      orderNo: order.order_no,
+      userId,
+      reason: reason || 'user cancelled',
+      items: items.map((i) => ({ productId: i.product_id, quantity: i.quantity })),
+    });
+
+    res.json({ message: 'Order cancelled', orderId: id });
+  } catch (err) {
+    next(err);
+  }
 });
 
-app.get('/health', (req, res) => res.json({ service: 'order-service', status: 'healthy' }));
+app.put('/orders/:id/pay', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { paymentId, paidAt } = req.body;
+
+    const orderRes = await query(
+      'SELECT * FROM orders WHERE id = $1',
+      [id]
+    );
+    if (!orderRes.length) throw new Errors.NotFoundError('Order not found');
+
+    const order = orderRes[0];
+    if (order.status !== 'pending') {
+      throw new Errors.ValidationError(`Order status is ${order.status}, cannot mark as paid`);
+    }
+
+    const result = await query(
+      `UPDATE orders SET status = 'paid', paid_at = $1, updated_at = NOW() WHERE id = $2 RETURNING *`,
+      [paidAt ? new Date(paidAt) : new Date(), id]
+    );
+
+    const eventBus = await EventBus.getInstance();
+    await eventBus.publish(EventTypes.ORDER_PAID, {
+      orderId: order.id,
+      orderNo: order.order_no,
+      userId: order.user_id,
+      paymentId,
+      payAmount: order.pay_amount,
+    });
+
+    res.json({ data: result[0] });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.put('/orders/:id/ship', async (req, res, next) => {
+  try {
+    const userId = getUserId(req);
+    const { id } = req.params;
+    const { trackingNumber, carrier } = req.body;
+
+    const orderRes = await query(
+      'SELECT * FROM orders WHERE id = $1',
+      [id]
+    );
+    if (!orderRes.length) throw new Errors.NotFoundError('Order not found');
+
+    const order = orderRes[0];
+    if (order.status !== 'paid') {
+      throw new Errors.ValidationError(`Order must be paid before shipping, current: ${order.status}`);
+    }
+
+    const result = await query(
+      `UPDATE orders SET status = 'shipped', shipped_at = NOW(), updated_at = NOW() WHERE id = $1 RETURNING *`,
+      [id]
+    );
+
+    const eventBus = await EventBus.getInstance();
+    await eventBus.publish(EventTypes.ORDER_SHIPPED, {
+      orderId: order.id,
+      orderNo: order.order_no,
+      userId: order.user_id,
+      trackingNumber,
+      carrier,
+    });
+
+    res.json({ data: result[0] });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.put('/orders/:id/complete', async (req, res, next) => {
+  try {
+    const userId = getUserId(req);
+    const { id } = req.params;
+
+    const orderRes = await query(
+      'SELECT * FROM orders WHERE id = $1',
+      [id]
+    );
+    if (!orderRes.length) throw new Errors.NotFoundError('Order not found');
+
+    const order = orderRes[0];
+    if (order.status !== 'shipped') {
+      throw new Errors.ValidationError(`Order must be shipped before completing, current: ${order.status}`);
+    }
+
+    const result = await query(
+      `UPDATE orders SET status = 'completed', completed_at = NOW(), updated_at = NOW() WHERE id = $1 RETURNING *`,
+      [id]
+    );
+
+    const eventBus = await EventBus.getInstance();
+    await eventBus.publish(EventTypes.ORDER_COMPLETED, {
+      orderId: order.id,
+      orderNo: order.order_no,
+      userId: order.user_id,
+    });
+
+    res.json({ data: result[0] });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── Health ──
+
+app.get('/health', async (req, res) => {
+  try {
+    await query('SELECT 1');
+    res.json({
+      service: process.env.SERVICE_NAME || 'order-service',
+      status: 'ok',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    res.status(503).json({
+      service: process.env.SERVICE_NAME || 'order-service',
+      status: 'unhealthy',
+      error: err.message,
+    });
+  }
+});
+
+// ── Error Handler ──
+
 app.use(errorHandler);
 
-const PORT = process.env.PORT || 3003;
-initDb().then(() => {
-  app.listen(PORT, () => logger.info(`OrderService on ${PORT}`));
+// ── Start ──
+
+app.listen(PORT, () => {
+  logger.info(`Order service running on port ${PORT}`);
 });

@@ -1,95 +1,171 @@
-/**
- * Order Saga — 分布式事务协调器
- * 步骤：扣库存 → 创建支付 → 清购物车
- * 任一步失败 → 补偿回滚
- */
 const axios = require('axios');
+const { getPool, query, transaction } = require('../../shared/lib/db');
+const { createLogger } = require('../../shared/lib/logger');
+const { EventBus, EventTypes } = require('../../shared/lib/events');
+
+const logger = createLogger('OrderSaga');
+
+const PRODUCT_SERVICE_URL = process.env.PRODUCT_SERVICE_URL || 'http://product-service:3002';
+const PAYMENT_SERVICE_URL = process.env.PAYMENT_SERVICE_URL || 'http://payment-service:3004';
 
 class OrderSaga {
-  constructor({ sagaId, order, items, eventBus, pool }) {
+  constructor({ sagaId, order, items, userId }) {
     this.sagaId = sagaId;
     this.order = order;
     this.items = items;
-    this.eventBus = eventBus;
-    this.pool = pool;
-    this.steps = [];
+    this.userId = userId;
+    this.stepResults = [];
     this.compensations = [];
   }
 
-  // ─── 执行 Saga ───
   async execute() {
-    const logger = console; // 简化
+    logger.info(`[Saga:${this.sagaId}] Starting order saga execution`, {
+      orderId: this.order.id,
+      orderNo: this.order.order_no,
+    });
 
     try {
-      // Step 1: 扣减库存
-      await this.step('deduct_inventory', async () => {
-        for (const item of this.items) {
-          await axios.post(`http://product-service:3002/products/${item.product_id}/deduct-stock`, {
-            quantity: item.quantity,
-            sku_id: item.sku_id,
-            order_id: this.order.id
-          });
-        }
-      }, async () => {
-        // 补偿：恢复库存
-        for (const item of this.items) {
-          try {
-            await axios.post(`http://product-service:3002/products/${item.product_id}/restore-stock`, {
-              quantity: item.quantity
-            });
-          } catch (e) { /* 补偿失败记录日志 */ }
-        }
-      });
+      await this.stepDeductStock();
+      await this.stepCreatePayment();
+      await this.stepClearCart();
 
-      // Step 2: 创建支付单
-      await this.step('create_payment', async () => {
-        await axios.post('http://payment-service:3004/payments', {
-          order_id: this.order.id,
-          order_no: this.order.order_no,
-          user_id: this.order.user_id,
-          amount: this.order.pay_amount,
-          description: `订单 ${this.order.order_no}`
-        });
-      }, async () => {
-        try {
-          await axios.post(`http://payment-service:3004/payments/${this.order.order_no}/cancel`);
-        } catch (e) {}
-      });
-
-      // Step 3: 清购物车
-      await this.step('clear_cart', async () => {
-        await this.pool.query('DELETE FROM carts WHERE user_id = $1 AND selected = TRUE', [this.order.user_id]);
-      });
-
-      // Saga 完成
-      await this.pool.query("UPDATE orders SET status = 'paid' WHERE id = $1", [this.order.id]);
-      await this.eventBus.publish('order.saga.completed', { saga_id: this.sagaId, order_id: this.order.id });
-      logger.info(`[Saga] Completed: ${this.sagaId}`);
-
+      await this.markOrderPaid();
+      logger.info(`[Saga:${this.sagaId}] Saga completed successfully`);
     } catch (err) {
-      logger.error(`[Saga] Failed: ${this.sagaId}, executing compensation...`);
+      logger.error(`[Saga:${this.sagaId}] Saga failed at step, starting compensation`, {
+        error: err.message,
+      });
       await this.compensate();
-
-      await this.pool.query("UPDATE orders SET status = 'cancelled' WHERE id = $1", [this.order.id]);
-      await this.eventBus.publish('order.saga.failed', { saga_id: this.sagaId, order_id: this.order.id, error: err.message });
     }
   }
 
-  async step(name, action, compensate) {
-    this.steps.push(name);
-    this.compensations.push(compensate);
-    await action();
+  async stepDeductStock() {
+    logger.info(`[Saga:${this.sagaId}] Step 1: Deducting stock`);
+    const results = [];
+
+    for (const item of this.items) {
+      const res = await axios.post(
+        `${PRODUCT_SERVICE_URL}/products/${item.product_id}/deduct-stock`,
+        { quantity: item.quantity, sagaId: this.sagaId },
+        { timeout: 10000 }
+      );
+      results.push({ productId: item.product_id, response: res.data });
+    }
+
+    this.stepResults.push({ step: 'deduct_stock', results });
+    this.compensations.unshift(async () => {
+      for (const item of this.items) {
+        try {
+          await axios.post(
+            `${PRODUCT_SERVICE_URL}/products/${item.product_id}/restore-stock`,
+            { quantity: item.quantity, sagaId: this.sagaId },
+            { timeout: 10000 }
+          );
+        } catch (err) {
+          logger.error(`[Saga:${this.sagaId}] Compensate stock failed`, {
+            productId: item.product_id,
+            error: err.message,
+          });
+        }
+      }
+    });
+
+    logger.info(`[Saga:${this.sagaId}] Step 1: Stock deducted`);
+  }
+
+  async stepCreatePayment() {
+    logger.info(`[Saga:${this.sagaId}] Step 2: Creating payment`);
+
+    const res = await axios.post(
+      `${PAYMENT_SERVICE_URL}/payments`,
+      {
+        orderId: this.order.id,
+        orderNo: this.order.order_no,
+        userId: this.userId,
+        amount: this.order.pay_amount,
+        description: `Order ${this.order.order_no}`,
+        sagaId: this.sagaId,
+      },
+      { timeout: 10000 }
+    );
+
+    this.stepResults.push({ step: 'create_payment', payment: res.data });
+    this.compensations.unshift(async () => {
+      try {
+        await axios.delete(
+          `${PAYBITMQ_URL}/payments/${res.data.id}?sagaId=${this.sagaId}`,
+          { timeout: 10000 }
+        );
+      } catch (err) {
+        logger.error(`[Saga:${this.sagaId}] Compensate payment failed`, {
+          paymentId: res.data.id,
+          error: err.message,
+        });
+      }
+    });
+
+    logger.info(`[Saga:${this.sagaId}] Step 2: Payment created`, {
+      paymentId: res.data.id,
+    });
+  }
+
+  async stepClearCart() {
+    logger.info(`[Saga:${this.sagaId}] Step 3: Clearing cart`);
+
+    await query(
+      'DELETE FROM carts WHERE user_id = $1 AND selected = TRUE',
+      [this.userId]
+    );
+
+    this.stepResults.push({ step: 'clear_cart' });
+    logger.info(`[Saga:${this.sagaId}] Step 3: Cart cleared`);
+  }
+
+  async markOrderPaid() {
+    logger.info(`[Saga:${this.sagaId}] Marking order as paid`);
+
+    await query(
+      `UPDATE orders SET status = 'paid', paid_at = NOW(), updated_at = NOW() WHERE id = $1`,
+      [this.order.id]
+    );
+
+    const eventBus = await EventBus.getInstance();
+    await eventBus.publish(EventTypes.ORDER_PAID, {
+      orderId: this.order.id,
+      orderNo: this.order.order_no,
+      userId: this.userId,
+      sagaId: this.sagaId,
+      items: this.items,
+      totalAmount: this.order.total_amount,
+      payAmount: this.order.pay_amount,
+    });
+
+    logger.info(`[Saga:${this.sagaId}] Order marked as paid`);
   }
 
   async compensate() {
-    // 反向执行补偿（LIFO）
-    for (let i = this.compensations.length - 1; i >= 0; i--) {
-      try {
-        await this.compensations[i]();
-      } catch (err) {
-        console.error(`[Saga] Compensation failed for step ${this.steps[i]}:`, err.message);
-      }
+    logger.warn(`[Saga:${this.sagaId}] Starting compensation (${this.compensations.length} steps)`);
+
+    for (const comp of this.compensations) {
+      await comp();
     }
+
+    await query(
+      `UPDATE orders SET status = 'pending', updated_at = NOW() WHERE id = $1`,
+      [this.order.id]
+    );
+
+    const eventBus = await EventBus.getInstance();
+    await eventBus.publish(EventTypes.ORDER_CREATED, {
+      orderId: this.order.id,
+      orderNo: this.order.order_no,
+      userId: this.userId,
+      status: 'pending',
+      sagaId: this.sagaId,
+      message: 'Saga failed, order reverted to pending',
+    });
+
+    logger.warn(`[Saga:${this.sagaId}] Compensation completed`);
   }
 }
 

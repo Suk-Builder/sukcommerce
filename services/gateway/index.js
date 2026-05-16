@@ -1,77 +1,63 @@
-/**
- * API Gateway — 统一入口
- * 路由 / 限流 / 熔断 / JWT验证 / 请求转发 / 日志
- */
-require('dotenv').config();
 const express = require('express');
-const httpProxy = require('http-proxy-middleware');
+const { createProxyMiddleware } = require('http-proxy-middleware');
 const Redis = require('ioredis');
-
-const { createLogger, requestIdMiddleware } = require('../../shared/lib/logger');
-const { Errors, errorHandler } = require('../../shared/lib/errors');
 const jwt = require('jsonwebtoken');
+const fetch = require('node-fetch');
+const { createLogger, requestIdMiddleware } = require('../../shared/lib/logger');
+const { errorHandler } = require('../../shared/lib/errors');
 
-const logger = createLogger();
+const logger = createLogger('gateway');
 const app = express();
 
-// ─── 中间件 ───
-app.use(express.json({ limit: '1mb' }));
-app.use(requestIdMiddleware);
+// ─── Config ───────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET;
+const REDIS_URL = process.env.REDIS_URL || 'redis://redis:6379';
 
-// ─── Redis 限流 ───
-const redis = new Redis(process.env.REDIS_URL);
+const SERVICE_URLS = {
+  user: process.env.USER_SERVICE_URL || 'http://user-service:3001',
+  product: process.env.PRODUCT_SERVICE_URL || 'http://product-service:3002',
+  order: process.env.ORDER_SERVICE_URL || 'http://order-service:3003',
+  payment: process.env.PAYMENT_SERVICE_URL || 'http://payment-service:3004',
+  notification: process.env.NOTIFICATION_SERVICE_URL || 'http://notification-service:3005',
+};
 
-async function rateLimit(req, res, next) {
-  const key = `ratelimit:${req.ip}:${req.path}`;
-  const window = parseInt(process.env.RATE_LIMIT_WINDOW) || 60000;
-  const max = parseInt(process.env.RATE_LIMIT_MAX) || 100;
+// ─── Redis ────────────────────────────────────────────────────────────
+const redis = new Redis(REDIS_URL);
+redis.on('error', (err) => logger.error('Redis error: %s', err.message));
+redis.on('connect', () => logger.info('Redis connected'));
 
-  const current = await redis.incr(key);
-  if (current === 1) await redis.pexpire(key, window);
+// ─── Metrics Store ────────────────────────────────────────────────────
+const metrics = {
+  requestsTotal: 0,
+  requestsByRoute: {},
+  errorsTotal: 0,
+  activeConnections: 0,
+  circuitBreakerStates: {},
+  startTime: Date.now(),
+};
 
-  res.setHeader('X-RateLimit-Limit', max);
-  res.setHeader('X-RateLimit-Remaining', Math.max(0, max - current));
-
-  if (current > max) {
-    return next(Errors.RATE_LIMITED());
-  }
-  next();
-}
-app.use(rateLimit);
-
-// ─── JWT 验证 ───
-function authenticate(req, res, next) {
-  const token = req.headers.authorization?.replace('Bearer ', '');
-  if (!token) return next(Errors.UNAUTHORIZED());
-
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = decoded;
-    next();
-  } catch (err) {
-    if (err.name === 'TokenExpiredError') return next(Errors.TOKEN_EXPIRED());
-    next(Errors.UNAUTHORIZED());
-  }
-}
-
-// ─── 熔断器 ───
+// ─── Circuit Breaker ──────────────────────────────────────────────────
 class CircuitBreaker {
-  constructor(name, threshold = 5, timeout = 30000) {
+  constructor(name) {
     this.name = name;
+    this.state = 'CLOSED';
     this.failures = 0;
-    this.threshold = threshold;
-    this.timeout = timeout;
-    this.state = 'CLOSED'; // CLOSED OPEN HALF_OPEN
-    this.lastFailure = null;
+    this.failureThreshold = 5;
+    this.resetTimeoutMs = 30000;
+    this.nextAttempt = 0;
+    metrics.circuitBreakerStates[name] = 'CLOSED';
   }
 
-  async call(fn) {
+  async execute(fn) {
     if (this.state === 'OPEN') {
-      if (Date.now() - this.lastFailure > this.timeout) {
-        this.state = 'HALF_OPEN';
-      } else {
-        throw Errors.CIRCUIT_OPEN();
+      if (Date.now() < this.nextAttempt) {
+        const remaining = Math.ceil((this.nextAttempt - Date.now()) / 1000);
+        throw new Error(`Circuit breaker OPEN for ${this.name}, retry after ${remaining}s`);
       }
+      this.state = 'HALF_OPEN';
+      metrics.circuitBreakerStates[this.name] = 'HALF_OPEN';
+      logger.info(`Circuit breaker HALF_OPEN for ${this.name}`);
     }
 
     try {
@@ -86,96 +72,225 @@ class CircuitBreaker {
 
   onSuccess() {
     this.failures = 0;
-    this.state = 'CLOSED';
+    if (this.state === 'HALF_OPEN') {
+      this.state = 'CLOSED';
+      metrics.circuitBreakerStates[this.name] = 'CLOSED';
+      logger.info(`Circuit breaker CLOSED for ${this.name}`);
+    }
   }
 
   onFailure() {
-    this.failures++;
-    this.lastFailure = Date.now();
-    if (this.failures >= this.threshold) {
+    this.failures += 1;
+    if (this.failures >= this.failureThreshold) {
       this.state = 'OPEN';
-      logger.warn(`Circuit OPEN: ${this.name}`);
+      this.nextAttempt = Date.now() + this.resetTimeoutMs;
+      metrics.circuitBreakerStates[this.name] = 'OPEN';
+      logger.warn('Circuit breaker OPEN for %s', this.name);
     }
   }
 }
 
-const breakers = {};
-function getBreaker(name) {
-  if (!breakers[name]) breakers[name] = new CircuitBreaker(name);
-  return breakers[name];
+const circuitBreakers = {};
+function getCircuitBreaker(name) {
+  if (!circuitBreakers[name]) {
+    circuitBreakers[name] = new CircuitBreaker(name);
+  }
+  return circuitBreakers[name];
 }
 
-// ─── 服务代理配置 ───
-const services = {
-  '/api/v1/users': { target: process.env.USER_SERVICE_URL, name: 'user' },
-  '/api/v1/auth': { target: process.env.USER_SERVICE_URL, name: 'user' },
-  '/api/v1/products': { target: process.env.PRODUCT_SERVICE_URL, name: 'product' },
-  '/api/v1/categories': { target: process.env.PRODUCT_SERVICE_URL, name: 'product' },
-  '/api/v1/search': { target: process.env.PRODUCT_SERVICE_URL, name: 'product' },
-  '/api/v1/orders': { target: process.env.ORDER_SERVICE_URL, name: 'order' },
-  '/api/v1/cart': { target: process.env.ORDER_SERVICE_URL, name: 'order' },
-  '/api/v1/payments': { target: process.env.PAYMENT_SERVICE_URL, name: 'payment' },
-  '/api/v1/webhooks': { target: process.env.PAYMENT_SERVICE_URL, name: 'payment' },
-  '/api/v1/notifications': { target: process.env.NOTIFICATION_SERVICE_URL, name: 'notification' },
-};
+// ─── JWT Middleware ───────────────────────────────────────────────────
+function jwtMiddleware(req, res, next) {
+  if (req.path === '/health' || req.path === '/metrics') return next();
 
-// ─── 路由注册 ───
-Object.entries(services).forEach(([path, config]) => {
-  const proxy = httpProxy.createProxyMiddleware({
-    target: config.target,
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Missing or invalid Authorization header' });
+  }
+
+  const token = authHeader.substring(7);
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}
+
+// ─── Rate Limit Middleware ────────────────────────────────────────────
+async function rateLimitMiddleware(req, res, next) {
+  const ip = req.ip || req.connection.remoteAddress;
+  const key = `ratelimit:${ip}`;
+  const limit = 100;
+  const windowSeconds = 60;
+
+  try {
+    const current = await redis.incr(key);
+    if (current === 1) {
+      await redis.expire(key, windowSeconds);
+    }
+
+    const remaining = Math.max(0, limit - current);
+    res.setHeader('X-RateLimit-Limit', limit);
+    res.setHeader('X-RateLimit-Remaining', remaining);
+    res.setHeader('X-RateLimit-Window', `${windowSeconds}s`);
+
+    if (current > limit) {
+      return res.status(429).json({ error: 'Rate limit exceeded. Try again later.' });
+    }
+    next();
+  } catch (err) {
+    logger.error('Rate limit check failed: %s', err.message);
+    next(); // fail-open: allow request on Redis error
+  }
+}
+
+// ─── Metrics Collection Middleware ────────────────────────────────────
+function metricsMiddleware(req, res, next) {
+  metrics.requestsTotal += 1;
+  metrics.activeConnections += 1;
+  const route = req.route ? req.route.path : req.path;
+  metrics.requestsByRoute[route] = (metrics.requestsByRoute[route] || 0) + 1;
+
+  res.on('finish', () => {
+    metrics.activeConnections = Math.max(0, metrics.activeConnections - 1);
+    if (res.statusCode >= 400) {
+      metrics.errorsTotal += 1;
+    }
+  });
+  next();
+}
+
+// ─── Proxy Factory ────────────────────────────────────────────────────
+function createServiceProxy(target) {
+  return createProxyMiddleware({
+    target,
     changeOrigin: true,
-    pathRewrite: (path) => path,
-    onError: (err, req, res) => {
-      logger.error(`Proxy error [${config.name}]:`, err.message);
-      res.status(503).json({ error: { code: 'E1001', message: '服务暂时不可用' } });
-    },
+    timeout: 30000,
+    proxyTimeout: 30000,
     onProxyReq: (proxyReq, req) => {
-      // 透传用户信息
+      proxyReq.setHeader('X-Request-ID', req.requestId || `req-${Date.now()}`);
       if (req.user) {
-        proxyReq.setHeader('X-User-Id', req.user.userId);
-        proxyReq.setHeader('X-User-Role', req.user.role || 'user');
+        proxyReq.setHeader('X-User-Id', req.user.id || req.user.sub || '');
+        proxyReq.setHeader('X-User-Role', req.user.role || '');
       }
-      proxyReq.setHeader('X-Request-ID', req.request_id);
-    }
+    },
+    onError: (err, req, res) => {
+      logger.error('Proxy error [%s%s]: %s', target, req.path, err.message);
+      if (!res.headersSent) {
+        res.status(502).json({ error: 'Bad Gateway', message: 'Service temporarily unavailable' });
+      }
+    },
+    onProxyRes: (proxyRes, req) => {
+      logger.info('[%d] %s %s → %s', proxyRes.statusCode, req.method, req.path, target);
+    },
   });
+}
 
-  // WebSocket 路径不验证
-  if (path.includes('ws')) {
-    app.use(path, proxy);
-  } else {
-    app.use(path, authenticate, proxy);
-  }
-});
+// ─── Circuit Breaker Wrapper ──────────────────────────────────────────
+function circuitBreakerProxy(target, serviceName) {
+  const proxy = createServiceProxy(target);
+  const cb = getCircuitBreaker(serviceName);
 
-// ─── 健康检查 ───
+  return (req, res, next) => {
+    cb.execute(() =>
+      new Promise((resolve, reject) => {
+        proxy(req, res, (err) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      })
+    ).catch((err) => {
+      if (err.message.includes('Circuit breaker OPEN')) {
+        return res.status(503).json({ error: 'Service temporarily unavailable', detail: err.message });
+      }
+      if (!res.headersSent) {
+        res.status(502).json({ error: 'Bad Gateway', message: err.message });
+      }
+    });
+  };
+}
+
+// ─── Middleware Stack ─────────────────────────────────────────────────
+app.use(requestIdMiddleware);
+app.use(express.json());
+app.use(metricsMiddleware);
+app.use(rateLimitMiddleware);
+app.use(jwtMiddleware);
+
+// ─── Service Routes ───────────────────────────────────────────────────
+const serviceRoutes = [
+  { path: '/api/v1/auth', target: SERVICE_URLS.user, name: 'user-service' },
+  { path: '/api/v1/users', target: SERVICE_URLS.user, name: 'user-service' },
+  { path: '/api/v1/products', target: SERVICE_URLS.product, name: 'product-service' },
+  { path: '/api/v1/categories', target: SERVICE_URLS.product, name: 'product-service' },
+  { path: '/api/v1/search', target: SERVICE_URLS.product, name: 'product-service' },
+  { path: '/api/v1/cart', target: SERVICE_URLS.order, name: 'order-service' },
+  { path: '/api/v1/orders', target: SERVICE_URLS.order, name: 'order-service' },
+  { path: '/api/v1/payments', target: SERVICE_URLS.payment, name: 'payment-service' },
+  { path: '/api/v1/webhooks', target: SERVICE_URLS.payment, name: 'payment-service', skipAuth: true },
+  { path: '/api/v1/notifications', target: SERVICE_URLS.notification, name: 'notification-service' },
+];
+
+for (const route of serviceRoutes) {
+  const handler = circuitBreakerProxy(route.target, route.name);
+  app.use(route.path, handler);
+}
+
+// ─── Health Check ─────────────────────────────────────────────────────
 app.get('/health', async (req, res) => {
-  const checks = {};
-  for (const [name, config] of Object.entries(services)) {
-    try {
-      const fetch = (await import('node-fetch')).default;
-      await fetch(`${config.target}/health`, { timeout: 3000 });
-      checks[name] = 'healthy';
-    } catch {
-      checks[name] = 'unhealthy';
-    }
-  }
-  const allHealthy = Object.values(checks).every(v => v === 'healthy');
-  res.status(allHealthy ? 200 : 503).json({
-    service: 'gateway',
-    status: allHealthy ? 'healthy' : 'degraded',
-    checks,
-    timestamp: new Date().toISOString()
+  const services = [
+    { name: 'user-service', url: `${SERVICE_URLS.user}/health` },
+    { name: 'product-service', url: `${SERVICE_URLS.product}/health` },
+    { name: 'order-service', url: `${SERVICE_URLS.order}/health` },
+    { name: 'payment-service', url: `${SERVICE_URLS.payment}/health` },
+    { name: 'notification-service', url: `${SERVICE_URLS.notification}/health` },
+  ];
+
+  const results = await Promise.all(
+    services.map(async (svc) => {
+      try {
+        const resp = await fetch(svc.url, { timeout: 5000 });
+        return { name: svc.name, status: resp.ok ? 'UP' : 'DOWN', statusCode: resp.status };
+      } catch (err) {
+        return { name: svc.name, status: 'DOWN', error: err.message };
+      }
+    })
+  );
+
+  const allUp = results.every((r) => r.status === 'UP');
+  const redisHealth = redis.status === 'ready' || redis.status === 'connect';
+
+  res.status(allUp && redisHealth ? 200 : 503).json({
+    status: allUp && redisHealth ? 'HEALTHY' : 'UNHEALTHY',
+    timestamp: new Date().toISOString(),
+    uptime: Math.floor(process.uptime()),
+    redis: redisHealth ? 'UP' : 'DOWN',
+    services: results,
   });
 });
 
+// ─── Metrics Endpoint ─────────────────────────────────────────────────
 app.get('/metrics', (req, res) => {
-  res.json({ service: 'gateway', uptime: process.uptime() });
+  const uptime = Math.floor((Date.now() - metrics.startTime) / 1000);
+  res.json({
+    requests_total: metrics.requestsTotal,
+    errors_total: metrics.errorsTotal,
+    active_connections: metrics.activeConnections,
+    uptime_seconds: uptime,
+    requests_by_route: metrics.requestsByRoute,
+    circuit_breaker_states: metrics.circuitBreakerStates,
+    memory_usage: process.memoryUsage(),
+    timestamp: new Date().toISOString(),
+  });
 });
 
+// ─── Error Handling ───────────────────────────────────────────────────
 app.use(errorHandler);
 
-const PORT = process.env.PORT || 3000;
+// ─── Start Server ─────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  logger.info(`Gateway running on port ${PORT}`);
-  logger.info(`Services: ${Object.keys(services).join(', ')}`);
+  logger.info('API Gateway running on port %d', PORT);
+  logger.info('Services: %j', SERVICE_URLS);
 });
+
+module.exports = app;
