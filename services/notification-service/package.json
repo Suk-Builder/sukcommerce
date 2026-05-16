@@ -1,0 +1,11 @@
+{
+  "name": "sukcommerce-notification",
+  "version": "1.0.0",
+  "dependencies": {
+    "express": "^4.18.2",
+    "nodemailer": "^6.9.7",
+    "amqplib": "^0.10.3",
+    "ws": "^8.14.2",
+    "winston": "^3.11.0"
+  }
+}
